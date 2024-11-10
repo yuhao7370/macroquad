@@ -12,7 +12,6 @@ readme="README.md"
 license = "MIT OR Apache-2.0"
 
 [features]
-audio = ["quad-snd"]
 log-rs = ["log"]
 glam-serde = ["glam/serde"]
 default = []
