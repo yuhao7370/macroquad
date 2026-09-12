@@ -813,8 +813,6 @@ impl QuadGl {
             && self.draw_calls[..self.draw_calls_count].iter().all(|dc| {
                 let pipeline = self.pipelines.pipelines[dc.pipeline.0].as_ref().unwrap();
                 !dc.capture && pipeline.vertex_rebase_safe
-                    // Unassigned extra samplers keep the original per-draw binding defaults/history.
-                    && pipeline.textures_data.len() == pipeline.textures.len()
             })
             && rebase_draw_indices(
                 &self.draw_calls[..self.draw_calls_count],
