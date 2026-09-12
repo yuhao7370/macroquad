@@ -704,28 +704,39 @@ impl QuadGl {
         let time = (miniquad::date::now() - self.start_time) as f32;
         let time = glam::vec4(time, time.sin(), time.cos(), 0.);
 
+        // ponytail: keep consecutive single-sample draws in one pass; snapshots/capture are barriers.
+        let mut active_pass: Option<Option<RenderPass>> = None;
         for (dc, bindings) in self.draw_calls[0..self.draw_calls_count]
             .iter_mut()
             .zip(self.draw_calls_bindings.iter_mut())
         {
             let pipeline = self.pipelines.get_quad_pipeline_mut(dc.pipeline);
 
-            let (width, height) = if let Some(render_pass) = dc.render_pass {
+            let (width, height, multisampled_target) = if let Some(render_pass) = dc.render_pass {
                 let render_texture = ctx.render_pass_texture(render_pass);
-                let (width, height) = ctx.texture_size(render_texture);
-                (width, height)
+                let params = ctx.texture_params(render_texture);
+                (params.width, params.height, params.sample_count > 1)
             } else {
-                (screen_width as u32, screen_height as u32)
+                (screen_width as u32, screen_height as u32, false)
             };
 
+            if active_pass.is_some()
+                && (active_pass != Some(dc.render_pass) || pipeline.wants_screen_texture)
+            {
+                ctx.end_render_pass();
+                active_pass = None;
+            }
             if pipeline.wants_screen_texture {
                 self.state.snapshotter.snapshot(ctx, dc.render_pass);
             }
 
-            if let Some(render_pass) = dc.render_pass {
-                ctx.begin_pass(Some(render_pass), PassAction::Nothing);
-            } else {
-                ctx.begin_default_pass(PassAction::Nothing);
+            if active_pass.is_none() {
+                if let Some(render_pass) = dc.render_pass {
+                    ctx.begin_pass(Some(render_pass), PassAction::Nothing);
+                } else {
+                    ctx.begin_default_pass(PassAction::Nothing);
+                }
+                active_pass = Some(dc.render_pass);
             }
 
             ctx.buffer_update(
@@ -785,7 +796,12 @@ impl QuadGl {
                 pipeline.uniforms_data.len(),
             );
             ctx.draw(0, dc.indices_count as i32, 1);
-            ctx.end_render_pass();
+
+            // Preserve per-draw MSAA resolves, including draws sampling the previous resolved image.
+            if multisampled_target || dc.capture {
+                ctx.end_render_pass();
+                active_pass = None;
+            }
 
             if dc.capture {
                 telemetry::track_drawcall(&pipeline.pipeline, bindings, dc.indices_count);
@@ -797,6 +813,9 @@ impl QuadGl {
             dc.indices_start = 0;
         }
 
+        if active_pass.is_some() {
+            ctx.end_render_pass();
+        }
         self.draw_calls_count = 0;
         self.batch_index_buffer.clear();
         self.batch_vertex_buffer.clear();
