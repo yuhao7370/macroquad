@@ -287,10 +287,127 @@ struct Uniform {
 struct PipelineExt {
     pipeline: miniquad::Pipeline,
     wants_screen_texture: bool,
+    vertex_rebase_safe: bool,
     uniforms: Vec<Uniform>,
     uniforms_data: Vec<u8>,
     textures: Vec<String>,
     textures_data: BTreeMap<String, MiniquadTexture>,
+}
+
+fn vertex_rebase_safe(source: &ShaderSource<'_>) -> bool {
+    let ShaderSource::Glsl { vertex, .. } = source else {
+        return false;
+    };
+    // ponytail: avoid preprocessing a shader; uncertain sources retain per-draw vertex IDs.
+    !vertex.contains("gl_VertexID")
+        && !vertex.contains('\\')
+        && vertex.lines().all(|line| {
+            let line = line.trim_start();
+            !line.contains('#') || line.starts_with("#version ") || line.starts_with("#extension ")
+        })
+}
+
+fn bulk_upload_sizes_fit(vertices: usize, indices: usize) -> bool {
+    // Miniquad's GL draw uses an i32 byte offset; rounded allocations must also fit 32-bit isize.
+    let max_bytes = (i32::MAX as usize).min(isize::MAX as usize);
+    vertices <= u16::MAX as usize
+        && [(vertices, size_of::<Vertex>()), (indices, size_of::<u16>())]
+            .into_iter()
+            .all(|(count, size)| {
+                count
+                    .checked_next_power_of_two()
+                    .and_then(|capacity| capacity.checked_mul(size))
+                    .is_some_and(|bytes| bytes <= max_bytes)
+            })
+}
+
+fn rebase_draw_indices(draws: &[DrawCall], vertices: usize, indices: &mut [u16]) -> bool {
+    if !bulk_upload_sizes_fit(vertices, indices.len()) {
+        return false;
+    }
+    // Validate everything before mutation so a late invalid local index keeps the fallback intact.
+    for dc in draws {
+        let Some(vertex_end) = dc.vertices_start.checked_add(dc.vertices_count) else {
+            return false;
+        };
+        let Some(index_end) = dc.indices_start.checked_add(dc.indices_count) else {
+            return false;
+        };
+        let Some(local) = indices.get(dc.indices_start..index_end) else {
+            return false;
+        };
+        if vertex_end > vertices || local.iter().any(|&i| i as usize >= dc.vertices_count) {
+            return false;
+        }
+    }
+    for dc in draws {
+        for index in &mut indices[dc.indices_start..dc.indices_start + dc.indices_count] {
+            *index += dc.vertices_start as u16;
+        }
+    }
+    true
+}
+
+#[test]
+fn bulk_upload_rebase_and_shader_guard() {
+    assert!(bulk_upload_sizes_fit(65_535, 1 << 29));
+    assert!(!bulk_upload_sizes_fit(65_536, 1));
+    // One extra index doubles the rounded IBO beyond signed 32-bit byte capacity.
+    assert!(!bulk_upload_sizes_fit(4, (1 << 29) + 1));
+    assert!(!bulk_upload_sizes_fit(
+        4,
+        i32::MAX as usize / size_of::<u16>() + 1
+    ));
+    assert!(!bulk_upload_sizes_fit(4, usize::MAX));
+    let call = |start, count, first_index, index_count| {
+        let mut dc = DrawCall::new(
+            None,
+            glam::Mat4::IDENTITY,
+            DrawMode::Triangles,
+            GlPipeline(0),
+            None,
+            None,
+        );
+        dc.vertices_start = start;
+        dc.vertices_count = count;
+        dc.indices_start = first_index;
+        dc.indices_count = index_count;
+        dc
+    };
+    let calls = [call(0, 4, 0, 3), call(50_000, 4, 3, 3)];
+    let mut indices = [0, 1, 2, 0, 2, 3];
+    assert!(rebase_draw_indices(&calls, 50_004, &mut indices));
+    assert_eq!(indices, [0, 1, 2, 50_000, 50_002, 50_003]);
+    let mut invalid = [0, 1, 2, 0, 2, 4];
+    let untouched = invalid;
+    assert!(!rebase_draw_indices(&calls, 50_004, &mut invalid));
+    assert_eq!(invalid, untouched);
+    let mut indices = [0, 1, 2, 0, 2, 3];
+    assert!(!rebase_draw_indices(&calls, 65_536, &mut indices));
+    assert_eq!(indices, [0, 1, 2, 0, 2, 3]);
+    assert!(!rebase_draw_indices(&calls, 50_003, &mut indices));
+    assert!(vertex_rebase_safe(&ShaderSource::Glsl {
+        vertex: shader::VERTEX,
+        fragment: ""
+    }));
+    for vertex in [
+        "void main(){int id=gl_VertexID;}",
+        "#define ID gl_VertexID\nvoid main(){}",
+        "# define ID gl_ ## VertexID\nvoid main(){}",
+        "#include <arbitrary_shader>",
+        "void main(){int id=gl_Ver\\\ntexID;}",
+    ] {
+        assert!(
+            !vertex_rebase_safe(&ShaderSource::Glsl {
+                vertex,
+                fragment: ""
+            }),
+            "{vertex}"
+        );
+    }
+    assert!(!vertex_rebase_safe(&ShaderSource::Msl {
+        program: shader::METAL
+    }));
 }
 
 impl PipelineExt {
@@ -524,6 +641,7 @@ impl PipelinesStorage {
         self.pipelines[id] = Some(PipelineExt {
             pipeline,
             wants_screen_texture,
+            vertex_rebase_safe: true,
             uniforms,
             uniforms_data: vec![0; max_offset],
             textures,
@@ -567,6 +685,8 @@ pub struct QuadGl {
 
     batch_vertex_buffer: Vec<Vertex>,
     batch_index_buffer: Vec<u16>,
+    batch_bindings: Option<Bindings>,
+    opengl: bool,
 }
 
 impl QuadGl {
@@ -600,6 +720,8 @@ impl QuadGl {
             white_texture,
             batch_vertex_buffer: Vec::with_capacity(max_vertices),
             batch_index_buffer: Vec::with_capacity(max_indices),
+            batch_bindings: None,
+            opengl: ctx.info().backend == Backend::OpenGl,
             max_vertices,
             max_indices,
         }
@@ -638,15 +760,20 @@ impl QuadGl {
             ShaderSource::Msl { program } => program,
         };
         let wants_screen_texture = source.contains("_ScreenTexture");
+        let vertex_rebase_safe = vertex_rebase_safe(&shader);
         let shader = ctx.new_shader(shader, shader_meta)?;
-        Ok(self.pipelines.make_pipeline(
+        let pipeline = self.pipelines.make_pipeline(
             ctx,
             shader,
             params,
             wants_screen_texture,
             uniforms,
             textures,
-        ))
+        );
+        self.pipelines
+            .get_quad_pipeline_mut(pipeline)
+            .vertex_rebase_safe = vertex_rebase_safe;
+        Ok(pipeline)
     }
 
     pub(crate) fn clear(&mut self, ctx: &mut dyn miniquad::RenderingBackend, color: Color) {
@@ -679,6 +806,58 @@ impl QuadGl {
     pub fn draw(&mut self, ctx: &mut dyn miniquad::RenderingBackend, projection: glam::Mat4) {
         let white_texture = self.white_texture;
 
+        let bulk_upload = self.opengl
+            && self.draw_calls_count > 1
+            && !self.batch_vertex_buffer.is_empty()
+            && !self.batch_index_buffer.is_empty()
+            && self.draw_calls[..self.draw_calls_count].iter().all(|dc| {
+                let pipeline = self.pipelines.pipelines[dc.pipeline.0].as_ref().unwrap();
+                !dc.capture && pipeline.vertex_rebase_safe
+                    // Unassigned extra samplers keep the original per-draw binding defaults/history.
+                    && pipeline.textures_data.len() == pipeline.textures.len()
+            })
+            && rebase_draw_indices(
+                &self.draw_calls[..self.draw_calls_count],
+                self.batch_vertex_buffer.len(),
+                &mut self.batch_index_buffer,
+            );
+
+        if bulk_upload {
+            let vertices = self.batch_vertex_buffer.len();
+            let indices = self.batch_index_buffer.len();
+            if self.batch_bindings.as_ref().map_or(true, |b| {
+                ctx.buffer_size(b.vertex_buffers[0]) < vertices * size_of::<Vertex>()
+                    || ctx.buffer_size(b.index_buffer) < indices * size_of::<u16>()
+            }) {
+                if let Some(old) = self.batch_bindings.take() {
+                    ctx.delete_buffer(old.vertex_buffers[0]);
+                    ctx.delete_buffer(old.index_buffer);
+                }
+                self.batch_bindings = Some(Bindings {
+                    vertex_buffers: vec![ctx.new_buffer(
+                        BufferType::VertexBuffer,
+                        BufferUsage::Stream,
+                        BufferSource::empty::<Vertex>(vertices.next_power_of_two()),
+                    )],
+                    index_buffer: ctx.new_buffer(
+                        BufferType::IndexBuffer,
+                        BufferUsage::Stream,
+                        BufferSource::empty::<u16>(indices.next_power_of_two()),
+                    ),
+                    images: vec![white_texture, white_texture],
+                });
+            }
+            let bindings = self.batch_bindings.as_ref().unwrap();
+            // One upload of each contiguous batch; ordinary buffer_update preserves in-flight GL reads.
+            ctx.buffer_update(
+                bindings.vertex_buffers[0],
+                BufferSource::slice(&self.batch_vertex_buffer),
+            );
+            ctx.buffer_update(
+                bindings.index_buffer,
+                BufferSource::slice(&self.batch_index_buffer),
+            );
+        }
         for _ in 0..self.draw_calls.len() - self.draw_calls_bindings.len() {
             let vertex_buffer = ctx.new_buffer(
                 BufferType::VertexBuffer,
@@ -706,10 +885,12 @@ impl QuadGl {
 
         // ponytail: keep consecutive single-sample draws in one pass; snapshots/capture are barriers.
         let mut active_pass: Option<Option<RenderPass>> = None;
-        for (dc, bindings) in self.draw_calls[0..self.draw_calls_count]
+        for (draw_index, dc) in self.draw_calls[0..self.draw_calls_count]
             .iter_mut()
-            .zip(self.draw_calls_bindings.iter_mut())
+            .enumerate()
         {
+            // Retain each draw slot's sampler defaults/history even while sharing the upload buffers.
+            let bindings = &mut self.draw_calls_bindings[draw_index];
             let pipeline = self.pipelines.get_quad_pipeline_mut(dc.pipeline);
 
             let (width, height, multisampled_target) = if let Some(render_pass) = dc.render_pass {
@@ -739,20 +920,22 @@ impl QuadGl {
                 active_pass = Some(dc.render_pass);
             }
 
-            ctx.buffer_update(
-                bindings.vertex_buffers[0],
-                BufferSource::slice(
-                    &self.batch_vertex_buffer
-                        [dc.vertices_start..(dc.vertices_start + dc.vertices_count)],
-                ),
-            );
-            ctx.buffer_update(
-                bindings.index_buffer,
-                BufferSource::slice(
-                    &self.batch_index_buffer
-                        [dc.indices_start..(dc.indices_start + dc.indices_count)],
-                ),
-            );
+            if !bulk_upload {
+                ctx.buffer_update(
+                    bindings.vertex_buffers[0],
+                    BufferSource::slice(
+                        &self.batch_vertex_buffer
+                            [dc.vertices_start..(dc.vertices_start + dc.vertices_count)],
+                    ),
+                );
+                ctx.buffer_update(
+                    bindings.index_buffer,
+                    BufferSource::slice(
+                        &self.batch_index_buffer
+                            [dc.indices_start..(dc.indices_start + dc.indices_count)],
+                    ),
+                );
+            }
 
             bindings.images[0] = dc.texture.unwrap_or(white_texture);
             bindings.images[1] = self
@@ -781,7 +964,16 @@ impl QuadGl {
             } else {
                 ctx.apply_scissor_rect(0, 0, width as i32, height as i32);
             }
-            ctx.apply_bindings(bindings);
+            if bulk_upload {
+                let shared = self.batch_bindings.as_ref().unwrap();
+                ctx.apply_bindings_from_slice(
+                    &shared.vertex_buffers,
+                    shared.index_buffer,
+                    &bindings.images,
+                );
+            } else {
+                ctx.apply_bindings(bindings);
+            }
 
             if let Some(ref uniforms) = dc.uniforms {
                 for i in 0..uniforms.len() {
@@ -795,7 +987,15 @@ impl QuadGl {
                 pipeline.uniforms_data.as_ptr(),
                 pipeline.uniforms_data.len(),
             );
-            ctx.draw(0, dc.indices_count as i32, 1);
+            ctx.draw(
+                if bulk_upload {
+                    dc.indices_start as i32
+                } else {
+                    0
+                },
+                dc.indices_count as i32,
+                1,
+            );
 
             // Preserve per-draw MSAA resolves, including draws sampling the previous resolved image.
             if multisampled_target || dc.capture {
@@ -1023,6 +1223,10 @@ impl QuadGl {
         max_vertices: usize,
         max_indices: usize,
     ) {
+        if let Some(shared) = self.batch_bindings.take() {
+            ctx.delete_buffer(shared.vertex_buffers[0]);
+            ctx.delete_buffer(shared.index_buffer);
+        }
         self.max_vertices = max_vertices;
         self.max_indices = max_indices;
         self.draw_calls_count = 0;
