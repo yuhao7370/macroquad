@@ -34,6 +34,24 @@ pub struct Font {
     characters: Arc<Mutex<HashMap<(char, u16), CharacterInfo>>>,
 }
 
+/// Decoded font data without an atlas or graphics-context access.
+/// Prepare this on a worker thread, then call [`load_ttf_font_from_prepared`]
+/// on the rendering thread.
+pub struct PreparedFont {
+    font: Arc<fontdue::Font>,
+}
+
+impl PreparedFont {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(Self {
+            font: Arc::new(fontdue::Font::from_bytes(
+                bytes,
+                fontdue::FontSettings::default(),
+            )?),
+        })
+    }
+}
+
 /// World space dimensions of the text, measured by "measure_text" function
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TextDimensions {
@@ -51,6 +69,7 @@ pub struct TextDimensions {
 fn require_fn_to_be_send() {
     fn require_send<T: Send>() {}
     require_send::<Font>();
+    require_send::<PreparedFont>();
 }
 
 impl std::fmt::Debug for Font {
@@ -64,10 +83,7 @@ impl std::fmt::Debug for Font {
 impl Font {
     pub(crate) fn load_from_bytes(atlas: Arc<Mutex<Atlas>>, bytes: &[u8]) -> Result<Font, Error> {
         Ok(Font {
-            font: Arc::new(fontdue::Font::from_bytes(
-                bytes,
-                fontdue::FontSettings::default(),
-            )?),
+            font: PreparedFont::from_bytes(bytes)?.font,
             characters: Arc::new(Mutex::new(HashMap::new())),
             atlas,
         })
@@ -285,12 +301,23 @@ pub async fn load_ttf_font(path: &str) -> Result<Font, Error> {
 /// let font = load_ttf_font_from_bytes(include_bytes!("font.ttf"));
 /// ```
 pub fn load_ttf_font_from_bytes(bytes: &[u8]) -> Result<Font, Error> {
+    Ok(load_ttf_font_from_prepared(PreparedFont::from_bytes(
+        bytes,
+    )?))
+}
+
+/// Attach decoded font data to a new GPU atlas. Must run on the rendering thread.
+pub fn load_ttf_font_from_prepared(prepared: PreparedFont) -> Font {
     let atlas = Arc::new(Mutex::new(Atlas::new(
         get_quad_context(),
         miniquad::FilterMode::Linear,
     )));
 
-    let mut font = Font::load_from_bytes(atlas.clone(), bytes)?;
+    let mut font = Font {
+        font: prepared.font,
+        atlas,
+        characters: Arc::new(Mutex::new(HashMap::new())),
+    };
 
     font.populate_font_cache(&Font::ascii_character_list(), 15);
 
@@ -298,7 +325,7 @@ pub fn load_ttf_font_from_bytes(bytes: &[u8]) -> Result<Font, Error> {
 
     font.set_filter(ctx.default_filter_mode);
 
-    Ok(font)
+    font
 }
 
 /// Draw text with given font_size
