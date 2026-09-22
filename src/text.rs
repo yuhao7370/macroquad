@@ -301,12 +301,13 @@ pub async fn load_ttf_font(path: &str) -> Result<Font, Error> {
 /// let font = load_ttf_font_from_bytes(include_bytes!("font.ttf"));
 /// ```
 pub fn load_ttf_font_from_bytes(bytes: &[u8]) -> Result<Font, Error> {
-    Ok(load_ttf_font_from_prepared(PreparedFont::from_bytes(
-        bytes,
-    )?))
+    let font = load_ttf_font_from_prepared(PreparedFont::from_bytes(bytes)?);
+    font.populate_font_cache(&Font::ascii_character_list(), 15);
+    Ok(font)
 }
 
 /// Attach decoded font data to a new GPU atlas. Must run on the rendering thread.
+/// Glyphs are cached lazily; use [`Font::populate_font_cache`] to warm them separately.
 pub fn load_ttf_font_from_prepared(prepared: PreparedFont) -> Font {
     let atlas = Arc::new(Mutex::new(Atlas::new(
         get_quad_context(),
@@ -318,8 +319,6 @@ pub fn load_ttf_font_from_prepared(prepared: PreparedFont) -> Font {
         atlas,
         characters: Arc::new(Mutex::new(HashMap::new())),
     };
-
-    font.populate_font_cache(&Font::ascii_character_list(), 15);
 
     let ctx = get_context();
 
