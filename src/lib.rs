@@ -826,6 +826,16 @@ impl EventHandler for Stage {
     fn window_restored_event(&mut self) {
         let context = get_context();
 
+        // Backgrounding can swallow release/cancel events. Drop stale gestures before
+        // the next frame, retaining release flags so the built-in UI also unlatches.
+        context.mouse_released.extend(context.mouse_down.drain());
+        context.mouse_pressed.clear();
+        context.keys_released.extend(context.keys_down.drain());
+        context.keys_pressed.clear();
+        context.chars_pressed_queue.clear();
+        context.chars_pressed_ui_queue.clear();
+        context.touches.clear();
+
         #[cfg(target_os = "android")]
         context.audio_context.resume();
         #[cfg(target_os = "android")]
@@ -833,10 +843,15 @@ impl EventHandler for Stage {
             miniquad::window::schedule_update();
         }
 
-        context
-            .input_events
-            .iter_mut()
-            .for_each(|arr| arr.push(MiniquadInputEvent::WindowRestored));
+        context.input_events.iter_mut().for_each(|arr| {
+            arr.retain(|event| {
+                matches!(
+                    event,
+                    MiniquadInputEvent::WindowMinimized | MiniquadInputEvent::WindowRestored
+                )
+            });
+            arr.push(MiniquadInputEvent::WindowRestored);
+        });
     }
 
     fn window_minimized_event(&mut self) {
