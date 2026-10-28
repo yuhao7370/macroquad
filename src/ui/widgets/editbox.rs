@@ -125,11 +125,18 @@ impl<'a> Editbox<'a> {
                     state.redo(text);
                 }
                 InputCharacter {
-                    key: Key::KeyCode(X),
+                    key: Key::KeyCode(key @ (C | X)),
                     modifier_ctrl: true,
                     ..
                 } => {
-                    state.delete_selected(text);
+                    if let Some(selected) =
+                        state.selected_text(text).filter(|text| !text.is_empty())
+                    {
+                        clipboard.set(&selected.iter().collect::<String>());
+                        if key == X {
+                            state.delete_selected(text);
+                        }
+                    }
                 }
                 InputCharacter {
                     key: Key::KeyCode(V),
